@@ -49,6 +49,7 @@ button:active{opacity:.7;}
 .toolbar{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:8px;}
 .sep{width:.5px;height:16px;background:var(--bmed);}
 .stats{font-size:11px;color:var(--muted);margin-left:auto;}
+.summary{font-size:11px;color:var(--muted);padding:8px 4px 0;}
 .tree-box{background:var(--surface);border:.5px solid var(--border);border-radius:var(--r);padding:10px 8px;min-height:48px;}
 .hint{color:var(--faint);font-size:13px;text-align:center;padding:16px 0;}
 ul.tree{list-style:none;padding:0;margin:0;}
@@ -122,6 +123,7 @@ ul.tree.kids{padding-left:20px;}
   <div class="tree-box">
     <div class="hint" id="hint">解析后的文件树显示在这里</div>
     <ul class="tree" id="root"></ul>
+    <div class="summary" id="summary" style="display:none"></div>
   </div>
 </div>
 
@@ -146,11 +148,21 @@ function ico(name,isDir,col){
   if(l==='dockerfile'||l.startsWith('docker-compose')) return '🐳';
   return IC[l.split('.').pop()]||'📄';
 }
+function applyDetectedType(node,info){
+  if(!info||!info.ok) return false;
+  const wasDir=node.isDir;
+  node.detectedType=info.kind;
+  node.mime=info.mime||'';
+  node.isDir=info.kind==='dir';
+  return wasDir!==node.isDir;
+}
 
 let tree=null;
 let showHidden=false;
 let statsDirty=true;
 let statsText='';
+let typeStatsTimer=null;
+const typeCache=new Map();
 
 const LEAF_FILES=new Set(['makefile','gnumakefile','kbuild','kconfig','cmakelists.txt','dockerfile','license','copying','notice','changelog','authors','install']);
 function looksLikeDir(name){
@@ -162,16 +174,38 @@ function looksLikeDir(name){
   if(l.includes('.')&&!(l.startsWith('.')&&l.indexOf('.',1)===-1)) return false;
   return true;
 }
+function pathJoin(base,name){
+  if(!base||base==='.') return name;
+  return base.replace(/\/$/,'')+'/'+name;
+}
+function cleanName(name){
+  const n=name.replace(/[/*@|=]$/,'');
+  return n||name;
+}
+function cleanPath(name){
+  const n=name.replace(/[/*@|=]$/,'');
+  return n||'.';
+}
+function summaryOf(line){
+  const m=line.match(/^(\d+)\s+directories?,\s+(\d+)\s+files?$/i);
+  return m?`${m[1]} directories, ${m[2]} files`:null;
+}
+function makeNode(name,comment,depth,path,rawName){
+  return {name,comment,children:[],depth,path,col:true,isDir:looksLikeDir(rawName),hidden:false,typeChecked:false};
+}
+function expandTop(ns){for(const n of ns)n.col=false;}
 
 function parse(text){
-  const root={name:'root',children:[],isDir:true,depth:-1};
+  const root={name:'root',children:[],isDir:true,depth:-2,path:''};
   const stack=[root];
-  let d=0,f=0;
+  let d=0,f=0,summary='';
   const depthOf=pre=>Math.floor(pre.replace(/\t/g,'    ').length/4);
   for(const rawLine of text.split('\n')){
     const line=rawLine.replace(/\u00a0/g,' ');
     const t=line.trim();
     if(!t||t==='.') continue;
+    const sm=summaryOf(t);
+    if(sm){summary=sm;continue;}
     let raw='',depth=0;
     const bm=line.match(/^([│ \t]*)(?:[├└]──\s?)(.*)$/);
     if(bm){
@@ -186,11 +220,20 @@ function parse(text){
     }
     const cm=raw.match(/^(.+?)\s{2,}#\s+(.+)$/)||raw.match(/^(.+?)\s+#\s+(.+)$/);
     const rawName=cm?cm[1].trim():raw;
-    const name=rawName.replace(/[/*@|=]$/,'');
+    const name=cleanName(rawName);
     const comment=cm?cm[2].trim():'';
+    if(!bm&&stack.length===1&&!root.children.length){
+      const node=makeNode(name,comment,-1,cleanPath(rawName),rawName);
+      node.isDir=true;
+      node.col=false;
+      root.children.push(node);
+      stack.push(node);
+      d++;
+      continue;
+    }
     while(stack.length>1&&stack[stack.length-1].depth>=depth) stack.pop();
-    const node={name,comment,children:[],depth,col:true,isDir:looksLikeDir(rawName),hidden:false};
     const parent=stack[stack.length-1];
+    const node=makeNode(name,comment,depth,pathJoin(parent.path,name),rawName);
     if(parent!==root&&!parent.isDir){f--;d++;}
     parent.isDir=true;
     parent.children.push(node);
@@ -198,6 +241,8 @@ function parse(text){
     stack.push(node);
   }
   root.statsText=`${d} 目录 ${f} 文件`;
+  root.summaryText=summary;
+  expandTop(root.children);
   return root;
 }
 
@@ -229,6 +274,7 @@ function mkNode(node,ul,parent){
   lbl.className='lbl'+(node.isDir?' d':'');
   lbl.textContent=node.name;
   row.appendChild(lbl);
+  detectLeafType(node,iconEl,lbl);
 
   const csep=document.createElement('span'); csep.className='csep'; csep.textContent='#';
   csep.style.display=node.comment?'':'none';
@@ -301,6 +347,31 @@ function mkNode(node,ul,parent){
   ul.appendChild(li);
 }
 
+function detectLeafType(node,iconEl,lbl){
+  if(node.children.length||node.typeChecked||!node.path) return;
+  node.typeChecked=true;
+  if(typeCache.has(node.path)){
+    if(applyDetectedType(node,typeCache.get(node.path))){
+      iconEl.textContent=ico(node.name,node.isDir,node.col);
+      lbl.className='lbl'+(node.isDir?' d':'');
+      scheduleStatsRefresh();
+    }
+    return;
+  }
+  fetch('/type?path='+encodeURIComponent(node.path),{cache:'no-store'})
+    .then(r=>r.ok?r.json():null)
+    .then(info=>{
+      if(!info||!info.ok) return;
+      typeCache.set(node.path,info);
+      if(applyDetectedType(node,info)){
+        iconEl.textContent=ico(node.name,node.isDir,node.col);
+        lbl.className='lbl'+(node.isDir?' d':'');
+        scheduleStatsRefresh();
+      }
+    })
+    .catch(()=>{});
+}
+
 function render(){
   const ul=document.getElementById('root');
   const frag=document.createDocumentFragment();
@@ -308,12 +379,20 @@ function render(){
   ul.replaceChildren(frag);
   document.getElementById('hint').style.display='none';
   document.getElementById('tb').style.display='flex';
+  const sum=document.getElementById('summary');
+  sum.textContent=tree.summaryText?`摘要：${tree.summaryText}`:'';
+  sum.style.display=tree.summaryText?'':'none';
   document.getElementById('hvb').textContent=showHidden?'隐藏隐藏项':'显示隐藏';
   updateStats();
 }
 
 function count(ns){let d=0,f=0,h=0;for(const n of ns){if(n.hidden){h++;if(!showHidden)continue;}n.isDir?d++:f++;const[cd,cf,ch]=count(n.children);d+=cd;f+=cf;h+=ch;}return[d,f,h];}
 function idle(fn){(window.requestIdleCallback||function(cb){return setTimeout(cb,0);})(fn);}
+function scheduleStatsRefresh(){
+  statsDirty=true;
+  if(typeStatsTimer) return;
+  typeStatsTimer=setTimeout(()=>{typeStatsTimer=null;updateStats();},100);
+}
 function updateStats(){
   const el=document.getElementById('stats');
   if(!statsDirty){el.textContent=statsText;return;}
