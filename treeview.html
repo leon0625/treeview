@@ -117,6 +117,9 @@ ul.tree.kids{padding-left:20px;}
     <div class="sep"></div>
     <button id="cpb" onclick="doCopy()">📋 复制</button>
     <button class="bp" onclick="doExport()">导出</button>
+    <button onclick="saveState()">💾 保存状态</button>
+    <button onclick="document.getElementById('si').click()">📥 导入状态</button>
+    <input type="file" id="si" accept=".json,application/json" onchange="onStateFile(event)" style="display:none;">
     <span class="stats" id="stats"></span>
   </div>
 
@@ -248,6 +251,7 @@ function parse(text){
 
 function mkNode(node,ul,parent){
   if(node.hidden&&!showHidden) return;
+  if(node.deleted) return;
   const li=document.createElement('li');
   const row=document.createElement('div');
   row.className='rn'+(node.comment?' hc':'')+(node.hidden?' gone':'');
@@ -326,8 +330,7 @@ function mkNode(node,ul,parent){
   dbtn.onclick=e=>{
     e.stopPropagation();
     if(!confirm(`删除 ${node.name} 及其子项？`)) return;
-    const i=parent.children.indexOf(node);
-    if(i>=0) parent.children.splice(i,1);
+    node.deleted=true;
     statsDirty=true;
     render();
   };
@@ -386,7 +389,7 @@ function render(){
   updateStats();
 }
 
-function count(ns){let d=0,f=0,h=0;for(const n of ns){if(n.hidden){h++;if(!showHidden)continue;}n.isDir?d++:f++;const[cd,cf,ch]=count(n.children);d+=cd;f+=cf;h+=ch;}return[d,f,h];}
+function count(ns){let d=0,f=0,h=0;for(const n of ns){if(n.deleted)continue;if(n.hidden){h++;if(!showHidden)continue;}n.isDir?d++:f++;const[cd,cf,ch]=count(n.children);d+=cd;f+=cf;h+=ch;}return[d,f,h];}
 function idle(fn){(window.requestIdleCallback||function(cb){return setTimeout(cb,0);})(fn);}
 function scheduleStatsRefresh(){
   statsDirty=true;
@@ -412,7 +415,7 @@ function toggleHidden(){showHidden=!showHidden;statsDirty=true;render();}
 function buildText(){
   const out=['.'];
   (function w(ns,pre){
-    const vis=ns.filter(n=>!n.hidden);
+    const vis=ns.filter(n=>!n.deleted&&!n.hidden);
     vis.forEach((n,i)=>{
       const last=i===vis.length-1;
       out.push(pre+(last?'└── ':'├── ')+n.name+(n.comment?'  # '+n.comment:''));
@@ -420,6 +423,101 @@ function buildText(){
     });
   })(tree.children,'');
   return out.join('\n');
+}
+
+function collectNodeState(node,states,deletedPaths){
+  if(node.deleted){
+    if(node.path) deletedPaths.push(node.path);
+  } else if(node.path){
+    states[node.path]={
+      comment:node.comment,
+      col:node.col,
+      hidden:node.hidden
+    };
+  }
+  for(const child of node.children){
+    collectNodeState(child,states,deletedPaths);
+  }
+}
+
+function saveState(){
+  if(!tree||!tree.children.length){
+    alert('没有树可保存');
+    return;
+  }
+  const states={};
+  const deletedPaths=[];
+  for(const child of tree.children){
+    collectNodeState(child,states,deletedPaths);
+  }
+  const state={
+    nodes:states,
+    deletedPaths:deletedPaths,
+    timestamp:new Date().toISOString()
+  };
+  const json=JSON.stringify(state,null,2);
+  const blob=new Blob([json],{type:'application/json'});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement('a');
+  a.href=url;
+  a.download='treeview-state.json';
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+function applyNodeState(node,states){
+  if(node.path&&states[node.path]){
+    const s=states[node.path];
+    node.comment=s.comment||'';
+    node.col=s.col!==undefined?s.col:node.col;
+    node.hidden=s.hidden||false;
+  }
+  for(const child of node.children){
+    applyNodeState(child,states);
+  }
+}
+
+function setNodeDeleted(node,deletedPaths){
+  if(deletedPaths.has(node.path)){
+    node.deleted=true;
+  }
+  for(const child of node.children){
+    setNodeDeleted(child,deletedPaths);
+  }
+}
+
+function loadState(state){
+  if(!tree){
+    alert('请先加载树文件');
+    return;
+  }
+  if(!state.nodes||typeof state.nodes!=='object'){
+    alert('无效的状态文件格式');
+    return;
+  }
+  const deletedSet=new Set(state.deletedPaths||[]);
+  for(const child of tree.children){
+    applyNodeState(child,state.nodes);
+    setNodeDeleted(child,deletedSet);
+  }
+  setNodeDeleted(tree,deletedSet);
+  statsDirty=true;
+  render();
+}
+
+function onStateFile(e){
+  const f=e.target.files[0];
+  if(!f) return;
+  const r=new FileReader();
+  r.onload=ev=>{
+    try{
+      const state=JSON.parse(ev.target.result);
+      loadState(state);
+    }catch(err){
+      alert('加载状态文件失败: '+err.message);
+    }
+  };
+  r.readAsText(f);
 }
 
 function doCopy(){
@@ -442,6 +540,17 @@ function loadText(txt){
     statsText=tree.statsText||'';
     statsDirty=false;
     render();
+    // Try to load saved state after tree is parsed
+    setTimeout(()=>{
+      fetch('/state',{cache:'no-store'})
+        .then(r=>r.ok?r.json():null)
+        .then(state=>{
+          if(state&&state.nodes&&typeof state.nodes==='object'){
+            loadState(state);
+          }
+        })
+        .catch(()=>{});
+    },100);
   },0);
 }
 function dzOver(e){e.preventDefault();document.getElementById('dz').classList.add('over');}
